@@ -1,0 +1,172 @@
+diff --git a/src/backend/access/nbtree/nbtsearch.c b/src/backend/access/nbtree/nbtsearch.c
+index e0bbb97..c15b26f 100644
+--- a/src/backend/access/nbtree/nbtsearch.c
++++ b/src/backend/access/nbtree/nbtsearch.c
+@@ -366,6 +366,37 @@ _bt_binsrch(Relation rel,
+ 	if (unlikely(high < low))
+ 		return low;
+ 
++
++	if (btree_binsrch_linear && P_ISLEAF(opaque))
++	{
++		int num_items = high - low + 1;
++
++		if(num_items>=2 && num_items <= btree_binsrch_linear_threshold){
++			cmpval = key->nextkey ? 0 : 1;
++			if(!key->backward){
++				for (OffsetNumber off = low; off <= high; off = OffsetNumberNext(off))
++				{
++					result = _bt_compare(rel, key, page, off);
++
++					if (result < cmpval){
++						return off;
++					}
++				}
++				return OffsetNumberNext(high);
++			}
++			else{
++				for (OffsetNumber off = high; off >= low; off = OffsetNumberPrev(off))
++				{
++					result = _bt_compare(rel, key, page, off);
++
++					if (result >= cmpval){
++						return off;
++					}
++				}
++				return OffsetNumberPrev(low);
++			}
++		}
++	}
+ 	/*
+ 	 * Binary search to find the first key on the page >= scan key, or first
+ 	 * key > scankey when nextkey is true.
+@@ -1937,6 +1968,25 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
+ 		so->currPos.itemIndex = MaxTIDsPerBTreePage - 1;
+ 	}
+ 
++	/*
++	Leaf page lookahead prefetch
++	*/
++
++	if (btree_leaf_prefetch && P_ISLEAF(opaque) && pstate.continuescan)
++	{
++		BlockNumber next_block = InvalidBlockNumber;
++
++		if (ScanDirectionIsForward(dir))
++			next_block = opaque->btpo_next;
++		else
++			next_block = opaque->btpo_prev;
++
++		if (BlockNumberIsValid(next_block) && next_block != NULL){
++			PrefetchBuffer(scan->indexRelation, MAIN_FORKNUM, next_block);
++		}
++	
++	}
++
+ 	return (so->currPos.firstItem <= so->currPos.lastItem);
+ }
+ 
+diff --git a/src/backend/access/nbtree/nbtutils.c b/src/backend/access/nbtree/nbtutils.c
+index 878f4b2..7ed8a71 100644
+--- a/src/backend/access/nbtree/nbtutils.c
++++ b/src/backend/access/nbtree/nbtutils.c
+@@ -103,6 +103,12 @@ static void _bt_checkkeys_look_ahead(IndexScanDesc scan, BTReadPageState *pstate
+ static int	_bt_keep_natts(Relation rel, IndexTuple lastleft,
+ 						   IndexTuple firstright, BTScanInsert itup_key);
+ 
++/*
++* GUC Definitions
++*/
++bool btree_leaf_prefetch = false;
++bool btree_binsrch_linear = false;
++int btree_binsrch_linear_threshold = 4;
+ 
+ /*
+  * _bt_mkscankey
+diff --git a/src/backend/utils/misc/guc_tables.c b/src/backend/utils/misc/guc_tables.c
+index c42fccf..740268e 100644
+--- a/src/backend/utils/misc/guc_tables.c
++++ b/src/backend/utils/misc/guc_tables.c
+@@ -111,6 +111,14 @@ extern bool trace_syncscan;
+ extern bool optimize_bounded_sort;
+ #endif
+ 
++
++/*
++* GUC local variables for nbtree.h
++*/
++extern bool btree_leaf_prefetch;
++extern bool btree_binsrch_linear;
++extern int btree_binsrch_linear_threshold;
++
+ /*
+  * Options for enum values defined in this module.
+  *
+@@ -2025,6 +2033,26 @@ struct config_bool ConfigureNamesBool[] =
+ 		false,
+ 		NULL, NULL, NULL
+ 	},
++	{
++		{"btree_leaf_prefetch", PGC_USERSET, DEVELOPER_OPTIONS,
++			gettext_noop("Enables lookahead prefetch of sibling leaf pages during B-Tree range scans."),
++			NULL,
++			0
++		},
++		&btree_leaf_prefetch,
++		false,
++		NULL, NULL, NULL
++	},
++	{
++		{"btree_binsrch_linear", PGC_USERSET, DEVELOPER_OPTIONS,
++			gettext_noop("Uses a linear scan on tiny B-Tree leaf pages instead of binary search."),
++			NULL,
++			0
++		},
++		&btree_binsrch_linear,
++		false,
++		NULL, NULL, NULL
++	},
+ 
+ 	/* End-of-list marker */
+ 	{
+@@ -3653,6 +3681,21 @@ struct config_int ConfigureNamesInt[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	/*
++	* GCU to set threshold for switching from binary search to linear search
++	*/
++
++	{
++		{"btree_binsrch_linear_threshold", PGC_USERSET, DEVELOPER_OPTIONS,
++			gettext_noop("The number of items (<=) in a leaf page for which a linear scan is used instead of a binary search."),
++			NULL,
++			0
++		},
++		&btree_binsrch_linear_threshold,
++		4, 1, 32,
++		NULL, NULL, NULL
++	},
++
+ 	/* End-of-list marker */
+ 	{
+ 		{NULL, 0, 0, NULL, NULL}, NULL, 0, 0, 0, NULL, NULL, NULL
+diff --git a/src/include/access/nbtree.h b/src/include/access/nbtree.h
+index 7493043..9a361f0 100644
+--- a/src/include/access/nbtree.h
++++ b/src/include/access/nbtree.h
+@@ -1197,6 +1197,14 @@ extern void _bt_parallel_done(IndexScanDesc scan);
+ extern void _bt_parallel_primscan_schedule(IndexScanDesc scan,
+ 										   BlockNumber prev_scan_page);
+ 
++/*
++* GUC parameters
++*/
++extern bool btree_leaf_prefetch;
++extern bool btree_binsrch_linear;
++extern int btree_binsrch_linear_threshold;
++
++
+ /*
+  * prototypes for functions in nbtdedup.c
+  */
